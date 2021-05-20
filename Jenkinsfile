@@ -1,93 +1,199 @@
-pipeline {
-agent none
-    
-stages {
-stage('Downloading code from GIT'){
-steps{
-git branch: 'FY21-Release4beforeR5', credentialsId: '59b26bb8-157c-4538-9b1c-9c7b4af06c0f', poll: false, url: 'http://10.100.8.119:7990/scm/hpjuke/hp2b.git'
+//Check if we are building trunk
+//We are not building tags, to build tag we are growing branch from tag.
+if (release == 'trunk') {
+    version = release
+    buildType = release
+} else {
+    buildType = 'branch'
+    version = release.split(/\//)[1]
 }
-}
+//Adding output to build history
+manager.addShortText(target + "/" + version, "red", "white", "0px", "white")
 
-stage('Artifactory Upload Details'){
-steps{
-rtUpload (
-    serverId: 'http://10.100.8.226:8081/artifactory',
-    spec: '''{
-          "files": [
-            {
-            "pattern": "**/wcbd-deploy-server-$BUILD_NUMBER.zip",
-            "target": "Jukebox_WCS_HP2B_FY20-Release2"
-        },
-        {
-            "pattern": "**/wcbd-deploy-search-$BUILD_NUMBER.zip",
-            "target": "Jukebox_WCS_HP2B_FY20-Release2"
-        },       
-        {
-            "pattern": "buildtag-$BUILD_NUMBER.*",
-            "target": "Jukebox_WCS_HP2B_FY20-Release2"
+// Workaround for serialization JENKINS-27421
+@NonCPS
+List<List<Object>> getMapKeys(map) {
+    map.collect { entry -> entry.key }
+}
+// End of workaround for serialization JENKINS-27421
+
+node(target) {
+    timestamps {
+
+        final String svnUrl = 'https://svn.example.com:8443'
+        final String svnPath = '/svn/' + release
+        final String sqlSkipMessage = 'Stage is skipped because of SQL scripts are not re-runnable for this release!'
+        final String massloadDir = 'massload'
+        final String sqlBackupDir = 'backup'
+        final String sqlBeforeDir = 'before'
+        final String sqlAfterDir = 'after'
+        final String sqlVerifyDir = 'verify'
+        final String helpersDir = 'helpers'
+        final String storeConfMergeDir = 'storeConfMerge'
+        final String storeConfigDir = 'storeconfigs'
+        final String wcbdDir = 'WCBD'
+        final String deploymentScriptsDir = 'scripts'
+
+        boolean buildFromBranch = env.buildFromBranch
+        boolean dbAction = true
+
+        // WCBD is always trunk, unless it's really necessary to change anything in the build process
+        // Something like adding new modules/targets
+        if (buildFromBranch) {
+            WCBDPath = svnPath + '/WCBD'
+        } else {
+            WCBDPath = '/svn/trunk/WCBD'
         }
-         ]
-    }''',
-)
-}
-}
+        println 'We are going to wcbd from: ' + WCBDPath
 
-stage('Capturing Build Data'){
-steps{
-rtBuildInfo (
-    captureEnv: true,
-    excludeEnvPatterns: ['*password*', '*secret*', '*key*'],
-)
-}
-}
-		
-stage('Building the Package'){
-steps {
-sh '''
-mkdir -p -m775 target server
-cd ${WORKSPACE}/source/workspace/Stores/WebContent/JukeboxSAS
-ln -s ~/node_modules node_modules
-gulp minify-js
-gulp minify-css
-rm node_modules
-cd /opt/IBM/WebSphere/CommerceServer80/wcbd
+        stage('Checkout') {
+            println "Building " + version + " for " + target + " buildType is: " + buildType
 
-./wcbd-ant -buildfile wcbd-nopackage-build.xml -Dbuild.label=$BUILD_NUMBER -Ddist.dir=${WORKSPACE}/target/app \
--Ddist.server.dir=${WORKSPACE}/target/app -Dbuild.branch=FY20-Release2 \
--Dworking.package.server.dir=${WORKSPACE}/server/app \
--Dsource.dir=${WORKSPACE}/source \
--Drun.extract=false
+            checkout([$class   : 'SubversionSCM', locations: [
+                    [credentialsId: 'jenkins.svn', depthOption: 'infinity', ignoreExternalsOption: true,
+                     local        : storeConfMergeDir, remote: svnUrl + '/svn/storeconfig_merge'],
+                    [credentialsId: 'jenkins.svn', depthOption: 'files', ignoreExternalsOption: true,
+                     local        : helpersDir, remote: svnUrl + '/svn/deployment/helpers'],
+                    [credentialsId: 'jenkins.svn', depthOption: 'files', ignoreExternalsOption: true,
+                     local        : sqlBackupDir, remote: svnUrl + svnPath + '/DatabaseObjects/backup'],
+                    [credentialsId: 'jenkins.svn', depthOption: 'files', ignoreExternalsOption: true,
+                     local        : massloadDir, remote: svnUrl + svnPath + '/DatabaseObjects/Massload'],
+                    [credentialsId: 'jenkins.svn', depthOption: 'files', ignoreExternalsOption: true,
+                     local        : storeConfigDir, remote: svnUrl + svnPath + '/DatabaseObjects/storeconfig'],
+                    [credentialsId: 'jenkins.svn', depthOption: 'files', ignoreExternalsOption: true,
+                     local        : sqlBeforeDir, remote: svnUrl + svnPath + '/DatabaseObjects/before'],
+                    [credentialsId: 'jenkins.svn', depthOption: 'files', ignoreExternalsOption: true,
+                     local        : sqlVerifyDir, remote: svnUrl + svnPath + '/DatabaseObjects/verify'],
+                    [credentialsId: 'jenkins.svn', depthOption: 'infinity', ignoreExternalsOption: true,
+                     local        : wcbdDir, remote: svnUrl + WCBDPath],
+                    [credentialsId: 'jenkins.svn', depthOption: 'files', ignoreExternalsOption: true,
+                     local        : deploymentScriptsDir, remote: svnUrl + '/svn/deployment'],
+                    [credentialsId: 'jenkins.svn', depthOption: 'files', ignoreExternalsOption: true,
+                     local        : sqlAfterDir, remote: svnUrl + svnPath + '/DatabaseObjects/after']
+            ], workspaceUpdater: [$class: 'UpdateWithCleanUpdater']])
+        }
 
-echo 
-echo
+        // Workaround for dtd files required for massload.
+        sh 'ln -fs ' + storeConfMergeDir + '/dtd dtd'
 
-cd search
-pwd
-./wcbd-ant -buildfile wcbd-build.xml -Dbuild.label=$BUILD_NUMBER -Ddist.dir=${WORKSPACE}/target/search \
--Ddist.server.dir=${WORKSPACE}/target/search -Dbuild.branch=FY20-Release2 \
--Dworking.package.server.dir=${WORKSPACE}/server/search \
--Dsource.dir=${WORKSPACE}/source \
--Drun.extract=false
+        //initializing internal scripts:
+        ant = load 'helpers/ant.groovy'
+        sqlrunner = load 'helpers/sqlRunner.groovy'
+        variables = load 'helpers/variables.groovy'
+        massload = load 'helpers/massload.groovy'
+        filesMap = load 'helpers/filesFinder.groovy'
 
-echo "BUILD_JOB_TAG=$BUILD_TAG" > ${WORKSPACE}/buildtag.properties
-echo "$BUILD_TAG" > ${WORKSPACE}/buildtag.html
+        //setting up required variables
+        variablesArray = variables.setVariables(target, wcbdDir)
+        //execute ant merge
+        ant.mergeStoreconfigs(target, variablesArray.javaHome, storeConfMergeDir)
+        //get massload map
+        massloadMap = filesMap.getXMLfilesMap(massloadDir.toString())
 
-cd ${WORKSPACE}
-cp buildtag.properties buildtag-$BUILD_NUMBER.properties
-cp buildtag.html buildtag-$BUILD_NUMBER.html
-'''
-}
-}
+        stage('Build') {
+            // Compiling the code
+            dir(wcbdDir) {
+                ant.wcbd(variablesArray, buildType, target, version, release, 'build')
+            }
+        }
 
-stage('Pushing Tag Details to Git'){
-steps{
-job('example-2') {
-    publishers {
-        git {
-            pushOnlyIfSuccess()
-            tag('$BUILD_TAG', 'foo-$PIPELINE_VERSION') {
-                message('Release $PIPELINE_VERSION')
-                create()
+
+        stage('SQL backup') {
+            if (dbAction) {
+                def sqlFiles = filesMap.getSQLfilesArray(sqlBackupDir)
+                sqlBackupRunner = sqlrunner.executeSQLs(sqlFiles, variablesArray)
+            } else {
+                println sqlSkipMessage
+            }
+        }
+
+        stage('Bootstrap') {
+            String type = 'bootstrap'
+            massloadMap = massload.executeMassload(type, massloadMap, variablesArray)
+        }
+
+        stage('AC User Groups') {
+            String type = 'acusergroups'
+            massloadMap = massload.executeMassload(type, massloadMap, variablesArray)
+        }
+
+        stage('Policy') {
+            String type = 'policies'
+            massloadMap = massload.executeMassload(type, massloadMap, variablesArray)
+        }
+
+        stage('Store Configs') {
+            String type = 'storeconfigs'
+            massloadMap = massload.executeMassload(type, massloadMap, variablesArray)
+        }
+
+        stage('Command') {
+            String type = 'command'
+            massloadMap = massload.executeMassload(type, massloadMap, variablesArray)
+        }
+
+        stage('Generic massloads') {
+            def types = getMapKeys(massloadMap)
+            if (types) {
+                for (String type : types) {
+                    massloadMap = massload.executeMassload(type, massloadMap, variablesArray)
+                }
+            } else {
+                println 'Nothing to load here.'
+            }
+        }
+
+        stage('SQL before') {
+            if (dbAction) {
+                def sqlFiles = filesMap.getSQLfilesArray(sqlBeforeDir)
+                sqlBackupRunner = sqlrunner.executeSQLs(sqlFiles, variablesArray)
+            } else {
+                println sqlSkipMessage
+            }
+        }
+
+        stage('SQL verify') {
+            if (dbAction) {
+                def sqlFiles = filesMap.getSQLfilesArray(sqlVerifyDir)
+                sqlBackupRunner = sqlrunner.executeSQLs(sqlFiles, variablesArray)
+            } else {
+                println sqlSkipMessage
+            }
+        }
+
+        stage('Deploy') {
+            // Deploying compiled code
+            String deployDir = wcbdDir + '/working/package/server'
+            dir(deployDir) {
+                ant.wcbd(variablesArray, buildType, target, version, release, 'deploy')
+            }
+        }
+
+        stage('Sync Cluster') {
+            // Synchronising deployed code from DMGR to all nodes in cluster one by one.
+            String runMe = variablesArray.wasHome + '/bin/wsadmin.sh -lang jython -user ' \
+                         + variablesArray.wasUser + ' -password ' + variablesArray.wasPassword \
+                         + ' -f ' + deploymentScriptsDir + '/syncRestart.py'
+            sh runMe
+        }
+
+        stage('SQL after') {
+            if (dbAction) {
+                def sqlFiles = filesMap.getSQLfilesArray(sqlAfterDir)
+                sqlBackupRunner = sqlrunner.executeSQLs(sqlFiles, variablesArray)
+            } else {
+                println sqlSkipMessage
+            }
+        }
+        stage('Sync httpd configs') {
+            dir(httpdConfDir){
+                def action = 'generate'
+                ant.httpdSync(variablesArray, target, action)
+            }
+        }
+        stage('Cleanups') {
+            dir(variablesArray.WS) {
+                deleteDir()
             }
         }
     }
